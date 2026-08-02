@@ -1,0 +1,59 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: grok-build-windows-x86_64
+            ext: .exe
+          - os: ubuntu-latest
+            artifact: grok-build-linux-x86_64
+            ext: ""
+          - os: macos-latest
+            artifact: grok-build-macos-aarch64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      # bin/protoc is a dotslash script that CI runners can't execute directly;
+      # xai-proto-build falls back to protoc from PATH.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p xai-grok-pager-bin --bin xai-grok-pager
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/xai-grok-pager${{ matrix.ext }}" dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error
