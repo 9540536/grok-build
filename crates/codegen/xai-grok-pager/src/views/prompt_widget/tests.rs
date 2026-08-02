@@ -786,16 +786,23 @@
 
     #[test]
     fn paste_single_line_exactly_threshold_stays_inline() {
-        // Exactly at the threshold stays inline (guards `>` vs `>=`).
+        // Just under the char threshold stays inline (guards `>=` boundary);
+        // at the threshold a single-line paste folds into a chip.
         let mut pw = PromptWidget::new();
-        let text = "x".repeat(PASTE_CHIP_DISPLAY_BYTES);
+        let text = "x".repeat(PASTE_CHIP_MIN_CHARS - 1);
         assert_eq!(text.lines().count(), 1, "fixture must be a single line");
         assert_eq!(pw.handle_paste(&text), PromptEvent::Edited);
         assert!(
             pw.textarea.elements().is_empty(),
-            "exactly-threshold single-line paste must stay inline"
+            "under-threshold single-line paste must stay inline"
         );
         assert_eq!(pw.textarea.text(), text);
+
+        let mut pw = PromptWidget::new();
+        let text = "x".repeat(PASTE_CHIP_MIN_CHARS);
+        assert_eq!(pw.handle_paste(&text), PromptEvent::Edited);
+        assert_eq!(pw.textarea.elements().len(), 1);
+        assert_eq!(pw.textarea.elements()[0].kind, KIND_PASTE);
     }
 
     #[test]

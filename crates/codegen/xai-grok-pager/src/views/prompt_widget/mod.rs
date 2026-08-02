@@ -48,6 +48,10 @@ pub const KIND_IMAGE: ElementKind = ElementKind(3);
 /// Byte size at which a single-line paste is chipped (display only — not an offload threshold).
 const PASTE_CHIP_DISPLAY_BYTES: usize = 10_000;
 
+/// Character-count threshold at which any paste folds into a chip even when
+/// it stays under the line/byte thresholds (long single-line pastes).
+const PASTE_CHIP_MIN_CHARS: usize = 200;
+
 pub use crate::prompt_images::PROMPT_IMAGES_TRACING_TARGET;
 
 /// What kind of element interaction occurred when pressing Enter on a chip.
@@ -2290,11 +2294,28 @@ impl PromptWidget {
         // multi-line pastes keep the line count.
         let by_lines = line_count >= chip_min_lines;
         let by_bytes = text.len() > PASTE_CHIP_DISPLAY_BYTES;
-        if by_lines || by_bytes {
+        // A long single-line paste (a log line, minified JS, a token dump)
+        // also folds: past ~2 prompt rows of characters it's an opaque blob
+        // the user will edit via the chip preview, not inline.
+        let by_chars = text.chars().count() >= PASTE_CHIP_MIN_CHARS;
+        tracing::info!(
+            target: "paste_debug",
+            text_len = text.len(),
+            line_count,
+            chip_min_lines,
+            by_lines,
+            by_bytes,
+            by_chars,
+            chip = by_lines || by_bytes || by_chars,
+            "handle_paste chip decision"
+        );
+        if by_lines || by_bytes || by_chars {
             let display = if by_bytes {
                 paste_chip_display_bytes(text.len())
-            } else {
+            } else if by_lines {
                 paste_chip_display(line_count)
+            } else {
+                paste_chip_display_chars(text.chars().count())
             };
             self.textarea
                 .insert_element(text, KIND_PASTE, Some(display));
@@ -3691,6 +3712,12 @@ fn paste_chip_display(line_count: usize) -> Line<'static> {
         line_count,
         if line_count != 1 { "s" } else { "" }
     ))
+}
+
+/// Display `Line` for a char-triggered paste chip (long single-line paste),
+/// e.g. `[Pasted: 2012 chars]`.
+fn paste_chip_display_chars(char_count: usize) -> Line<'static> {
+    chip_line(format!("Pasted: {char_count} chars"))
 }
 
 /// Display `Line` for a byte-triggered paste chip, e.g. `[Pasted: 12 KB]` or

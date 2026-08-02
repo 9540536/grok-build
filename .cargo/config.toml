@@ -59,14 +59,14 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
-# Some crates emit extremely long mangled symbol names that overflow the PDB
-# public-symbol record limit (LNK4318 → fatal LNK4319) when linking the larger
-# binaries (e.g. xai-grok-pager). The v0 mangling scheme compresses repeated
-# path prefixes, keeping symbol names within the linker's limits.
-rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static", "-C", "symbol-mangling-version=v0"]
+# symbol-mangling-version=v0: long generic symbol names otherwise overflow the
+# PDB public-symbol record limit (LNK4318 → fatal LNK4319) on debug links.
+# /STACK:8MB: the MSVC default 1 MB main-thread stack overflows at startup in
+# unoptimized builds (deep async init frames); unix mains get 8 MB by default.
+rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static", "-C", "symbol-mangling-version=v0", "-C", "link-arg=/STACK:8388608"]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static", "-C", "symbol-mangling-version=v0"]
+rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static", "-C", "symbol-mangling-version=v0", "-C", "link-arg=/STACK:8388608"]
 
 
 # jemalloc page size for Apple Silicon (macOS aarch64 uses 16KB pages = 2^14).

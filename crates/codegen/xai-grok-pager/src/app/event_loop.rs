@@ -3054,8 +3054,32 @@ async fn drain_and_process(
 
     // On terminals without bracketed paste, try to capture more events
     // that may still be in transit from the input reader thread.
-    if should_extend_for_paste(&raw_events) && detect_paste(&mut raw_events, input_rx).await {
+    if should_extend_for_paste(&raw_events) && {
+        // A batch already holding a large key run IS a paste in progress —
+        // no human queues 16+ keystrokes between two event-loop polls. Skip
+        // the short detection probe (whose 2ms window misses conhost's
+        // ~90ms inter-chunk gaps) and go straight to collection.
+        let large_run = raw_events
+            .iter()
+            .filter(|e| is_pasteable_key_event(&e.event))
+            .count()
+            >= PASTE_BATCH_IS_PASTE_KEYS;
+        let detected = large_run || detect_paste(&mut raw_events, input_rx).await;
+        tracing::info!(
+            target: "paste_debug",
+            detected,
+            large_run,
+            batch_len = raw_events.len(),
+            "paste extension probe (no bracketed Event::Paste in batch)"
+        );
+        detected
+    } {
         collect_remaining_paste(&mut raw_events, input_rx).await;
+        tracing::info!(
+            target: "paste_debug",
+            batch_len = raw_events.len(),
+            "paste extension collected remaining events"
+        );
         // The paste extension pulled more events off the channel without
         // running them through the still-armed filter — a late or split
         // XTVERSION reply could otherwise be folded into the paste.
@@ -3317,7 +3341,18 @@ async fn drain_and_process(
 const PASTE_DETECT_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// Timeout for subsequent rounds once paste has been detected.
+/// Windows conhost/ConPTY relays large pastes to the input reader in
+/// chunks separated by ~90ms of silence; a 10ms window there splits one
+/// paste into several fragments (multiple chips, or leading raw text).
+#[cfg(target_os = "windows")]
+const PASTE_CONTINUE_TIMEOUT: Duration = Duration::from_millis(150);
+#[cfg(not(target_os = "windows"))]
 const PASTE_CONTINUE_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// A single batch containing this many pasteable key events is treated as
+/// a paste without waiting on [`PASTE_DETECT_TIMEOUT`] — no human types
+/// 16 keystrokes between two event-loop polls.
+const PASTE_BATCH_IS_PASTE_KEYS: usize = 16;
 
 /// Safety cap on events accumulated in one extension pass.
 const PASTE_EXTEND_MAX_EVENTS: usize = 5_000;
@@ -3391,6 +3426,14 @@ pub(super) fn drain_immediate(
 
 /// Minimum key events in a run to trigger paste coalescing.
 const PASTE_COALESCE_THRESHOLD: usize = 3;
+
+/// Minimum run length for the no-Enter rapid-burst coalesce branch
+/// (single-line pastes on terminals without bracketed paste).
+const RAPID_BURST_MIN_KEYS: usize = 16;
+
+/// Maximum average inter-key gap for a run to count as a rapid burst.
+/// Paste bursts arrive at ≤ ~1ms/key; human typing is ≥ ~100ms/key.
+const RAPID_BURST_MAX_AVG: Duration = Duration::from_millis(10);
 
 /// Minimum run length for the Windows path-shape coalesce branch.
 /// Covers the shortest realistic dropped image path (`C:\x.png`,
@@ -3507,6 +3550,13 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
         has_paste |= matches!(e.event, Event::Paste(_));
         has_keys |= is_pasteable_key_event(&e.event);
     }
+    tracing::info!(
+        target: "paste_debug",
+        batch_len = events.len(),
+        has_paste,
+        has_keys,
+        "coalesce_rapid_keys batch"
+    );
     if has_paste {
         return if has_keys {
             merge_paste_fragments(events)
@@ -3528,6 +3578,15 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
     let mut result = Vec::with_capacity(events.len());
     let mut i = 0;
 
+    // Space Release events survive the filter above (voice-chord exception)
+    // and would otherwise split a pasted run at every space — Windows
+    // terminals without bracketed paste deliver press+release pairs. Treat
+    // them as transparent inside a run: they neither break it nor add text.
+    let is_transparent_release = |ev: &Event| {
+        matches!(ev, Event::Key(ke)
+            if ke.kind == KeyEventKind::Release && ke.code == KeyCode::Char(' '))
+    };
+
     while i < events.len() {
         if is_pasteable_key_event(&events[i].event) {
             let run_start = i;
@@ -3535,8 +3594,17 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
             let mut text = String::new();
             let mut seen_enter = false;
             let mut has_char_after_enter = false;
+            let mut key_count = 0usize;
+            let mut last_arrival = arrived_at;
 
-            while i < events.len() && is_pasteable_key_event(&events[i].event) {
+            while i < events.len() {
+                if is_transparent_release(&events[i].event) {
+                    i += 1;
+                    continue;
+                }
+                if !is_pasteable_key_event(&events[i].event) {
+                    break;
+                }
                 if let Event::Key(ke) = &events[i].event {
                     match ke.code {
                         KeyCode::Char(c) => {
@@ -3558,11 +3626,21 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
                         _ => unreachable!("is_pasteable_key_event guards this"),
                     }
                 }
+                key_count += 1;
+                last_arrival = events[i].arrived_at;
                 i += 1;
             }
 
-            let run_len = i - run_start;
+            let run_len = key_count;
             let multiline_paste = run_len >= PASTE_COALESCE_THRESHOLD && has_char_after_enter;
+            // A long run arriving far faster than human typing is a paste
+            // even without an Enter — single-line pastes on terminals
+            // without bracketed paste otherwise insert char-by-char and
+            // never fold. Average inter-key gap under RAPID_BURST_MAX_AVG
+            // (humans type ≥ ~100ms/key; paste bursts are ≤ ~1ms/key).
+            let span = last_arrival.duration_since(arrived_at);
+            let rapid_burst = run_len >= RAPID_BURST_MIN_KEYS
+                && span <= RAPID_BURST_MAX_AVG.saturating_mul(run_len as u32);
             // Windows fallback for drag-drops that arrive as a key
             // burst instead of a bracketed paste — reuse the drop
             // classifier's anchor detector so the two layers can't
@@ -3572,7 +3650,20 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
                 && crate::prompt_images::starts_with_drop_anchor(&text);
             #[cfg(not(target_os = "windows"))]
             let path_shaped_drop = false;
-            if multiline_paste || path_shaped_drop {
+            tracing::info!(
+                target: "paste_debug",
+                run_len,
+                text_len = text.len(),
+                seen_enter,
+                has_char_after_enter,
+                rapid_burst,
+                span_ms = span.as_millis() as u64,
+                path_shaped_drop,
+                coalesced = multiline_paste || path_shaped_drop || rapid_burst,
+                preview = %text.chars().take(60).collect::<String>(),
+                "key-run coalesce decision"
+            );
+            if multiline_paste || path_shaped_drop || rapid_burst {
                 tracing::debug!(
                     run_len,
                     text_len = text.len(),
