@@ -812,6 +812,29 @@ impl SessionActor {
         )
         .await;
     }
+    /// Build the sampler for the image-description model (the vision-capable
+    /// model configured via `[models] image_description`). Returns
+    /// `(model_id, sampling client)` or the error message. Shared by
+    /// user-attachment transcription and tool-result image transcription so
+    /// both resolve auth/attribution identically.
+    pub(super) async fn image_describe_sampler(
+        &self,
+    ) -> Result<(String, xai_grok_sampler::SamplingClient), String> {
+        let active_session_config = self.reconstruct_full_config().await;
+        let resolved_describe = self
+            .resolve_aux_sampler_config(&self.image_description_model)
+            .await;
+        let (describe_model, sampler_config) =
+            crate::agent::config::finalize_image_describe_sampler_config(
+                resolved_describe,
+                &active_session_config,
+                self.client_identifier.clone(),
+                Some(self.max_retries),
+            );
+        let client = xai_grok_sampler::SamplingClient::new(sampler_config)
+            .map_err(|e| format!("failed to build image-describe sampling client: {e}"))?;
+        Ok((describe_model, client))
+    }
     /// Run the image-transcription pipeline for a turn that contains
     /// user-supplied images. Returns the new `user_message` text with the
     /// `<image>` / `<image_files>` envelopes prepended; on any failure
@@ -840,21 +863,8 @@ impl SessionActor {
         let current_query = crate::session::image_describe::strip_template_context_tags(
             &xai_chat_state::compaction_utils::extract_user_query(&original_user_message),
         );
-        let active_session_config = self.reconstruct_full_config().await;
-        let resolved_describe = self
-            .resolve_aux_sampler_config(&self.image_description_model)
-            .await;
-        let (describe_model, sampler_config) =
-            crate::agent::config::finalize_image_describe_sampler_config(
-                resolved_describe,
-                &active_session_config,
-                self.client_identifier.clone(),
-                Some(self.max_retries),
-            );
-        let client = xai_grok_sampler::SamplingClient::new(sampler_config).map_err(|e| {
-            acp::Error::internal_error().data(format!(
-                "failed to build image-describe sampling client: {e}"
-            ))
+        let (describe_model, client) = self.image_describe_sampler().await.map_err(|e| {
+            acp::Error::internal_error().data(format!("image transcription failed: {e}"))
         })?;
         let model = &describe_model;
         let limit = crate::session::image_describe::IMAGE_DESCRIPTION_PROCESSING_LIMIT;

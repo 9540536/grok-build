@@ -2299,6 +2299,25 @@ impl SessionActor {
                 had_commit_in_session: false,
             });
     }
+    /// Transcribe tool-result images via the image-description model. The
+    /// coding model never receives inline image parts (its endpoint may
+    /// reject `image_url` content), so tool images are described by the
+    /// configured vision model (`[models] image_description`) and the
+    /// description is injected as text. Returns the description text, or an
+    /// error message for the caller to degrade to a text notice.
+    async fn transcribe_tool_images(&self, urls: &[String]) -> Result<String, String> {
+        let (model, client) = self.image_describe_sampler().await?;
+        let prompt_text = "Your task is to describe the image(s) produced by a tool, so that another model that cannot see images can perform its task. Be thorough: include a high-level description plus any and all details that may be relevant (text, UI elements, code, diagrams, numbers)."
+            .to_owned();
+        crate::session::image_describe::describe_user_images(
+            client,
+            &model,
+            prompt_text,
+            urls,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
     pub(super) async fn handle_bridge_tool_success(
         &self,
         tool_call_id: &acp::ToolCallId,
@@ -2407,7 +2426,6 @@ impl SessionActor {
         } else {
             result.prompt_text
         };
-        let mut inline_images: Vec<ContentPart> = Vec::new();
         let extraction = if !self.is_cursor_harness()
             && !matches!(
                 result.output,
@@ -2454,42 +2472,50 @@ impl SessionActor {
                         "data:{};base64,{}",
                         image_content.mime_type, image_content.data
                     );
-                    inline_images.push(ContentPart::Image {
-                        url: std::sync::Arc::<str>::from(url),
-                    });
-                    prompt_text = format!("Read image file: {path}");
+                    match self.transcribe_tool_images(std::slice::from_ref(&url)).await {
+                        Ok(description) => {
+                            prompt_text = format!(
+                                "Read image file: {path}\n<image_description>\n{description}\n</image_description>"
+                            );
+                        }
+                        Err(e) => {
+                            prompt_text = format!(
+                                "Read image file: {path}\n[Image transcription failed: {e}]"
+                            );
+                        }
+                    }
                 }
             }
         }
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = result.output
         {
-            for page in &pdf.pages {
-                let url = format!("data:{};base64,{}", page.mime_type, page.data);
-                inline_images.push(ContentPart::Image {
-                    url: std::sync::Arc::<str>::from(url),
-                });
-            }
             let path = tool_parsed_args
                 .get("target_file")
                 .or_else(|| tool_parsed_args.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
+            let mut page_descriptions = Vec::with_capacity(pdf.pages.len());
+            for (index, page) in pdf.pages.iter().enumerate() {
+                let url = format!("data:{};base64,{}", page.mime_type, page.data);
+                match self.transcribe_tool_images(std::slice::from_ref(&url)).await {
+                    Ok(description) => {
+                        page_descriptions.push(format!("Page {}:\n{description}", index + 1));
+                    }
+                    Err(e) => {
+                        page_descriptions
+                            .push(format!("Page {}: [transcription failed: {e}]", index + 1));
+                    }
+                }
+            }
             prompt_text = format!(
-                "Read PDF file: {path} ({} pages rendered, {} total)",
+                "Read PDF file: {path} ({} pages rendered, {} total)\n<image_description>\n{}\n</image_description>",
                 pdf.pages.len(),
                 pdf.total_pages,
+                page_descriptions.join("\n\n"),
             );
         }
-        let tool_chat = if inline_images.is_empty() {
-            ConversationItem::tool_result(call_id.to_string(), prompt_text)
-        } else {
-            ConversationItem::tool_result_with_images(
-                call_id.to_string(),
-                prompt_text,
-                inline_images,
-            )
-        };
+        let tool_chat = ConversationItem::tool_result(call_id.to_string(), prompt_text);
         self.chat_state_handle.push_tool_result(tool_chat);
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
@@ -2525,12 +2551,24 @@ impl SessionActor {
                 self.send_xai_notification(XaiSessionUpdate::ImageDropped { notes })
                     .await;
             }
-            for norm in norm_result.images {
-                let url = format!("data:{};base64,{}", norm.mime_type, norm.data);
-                let mut image_msg =
-                    ConversationItem::user("[Image extracted from tool result above]");
-                image_msg.add_image(url);
-                deferred_followups.push(image_msg);
+            if !norm_result.images.is_empty() {
+                let urls: Vec<String> = norm_result
+                    .images
+                    .iter()
+                    .map(|img| format!("data:{};base64,{}", img.mime_type, img.data))
+                    .collect();
+                match self.transcribe_tool_images(&urls).await {
+                    Ok(description) => {
+                        deferred_followups.push(ConversationItem::user(format!(
+                            "[Image extracted from tool result above]\n<image_description>\n{description}\n</image_description>"
+                        )));
+                    }
+                    Err(e) => {
+                        deferred_followups.push(ConversationItem::user(format!(
+                            "[Image extracted from tool result above, but image transcription failed: {e}]"
+                        )));
+                    }
+                }
             }
         }
         Ok(deferred_followups)
