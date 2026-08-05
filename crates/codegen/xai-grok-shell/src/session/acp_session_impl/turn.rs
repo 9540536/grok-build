@@ -599,36 +599,9 @@ impl SessionActor {
         let user_images = self
             .normalize_images_with_notices(&mut context, raw_images, is_cursor)
             .await;
-        let (query, extra_images) = if !self.is_cursor_harness() {
-            let extraction = xai_grok_tools::util::base64_images::extract_base64_images(query);
-            if extraction.images.is_empty() {
-                (extraction.text, Vec::new())
-            } else {
-                let cleaned_text = extraction.text;
-                let count = extraction.images.len();
-                tracing::info!(
-                    session_id = %self.session_info.id,
-                    count,
-                    "base64 images extracted from user query",
-                );
-                let acp_imgs: Vec<agent_client_protocol::ImageContent> = extraction
-                    .images
-                    .into_iter()
-                    .map(|img| agent_client_protocol::ImageContent::new(img.data, img.mime_type))
-                    .collect();
-                let nr = crate::session::image_normalize::normalize_images(acp_imgs, false).await;
-                if !nr.re_encode_fallbacks.is_empty() {
-                    tracing::warn!(
-                        session_id = %self.session_info.id,
-                        notes = %nr.re_encode_fallbacks.join(" "),
-                        "Extracted user query image kept original after re-encode failure",
-                    );
-                }
-                (cleaned_text, nr.images)
-            }
-        } else {
-            (query, Vec::new())
-        };
+        // Inline base64 data-URIs in the query text are left as-is: images are
+        // transcribed by the image-description model instead of being extracted
+        // and attached as inline multimodal parts.
         let assembled = crate::session::prompt_parser::ParsedPrompt::assemble_parts_with_skills(
             &context,
             &query,
@@ -704,30 +677,13 @@ impl SessionActor {
         self.inject_workflow_status_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
-        } else if self.is_cursor_harness() {
+        } else {
             self.transcribe_user_images(user_message, &user_images)
                 .await?
-        } else {
-            let session_dir =
-                crate::session::persistence::session_dir(&crate::session::info::Info {
-                    id: self.session_info.id.clone(),
-                    cwd: self.session_info.cwd.clone(),
-                });
-            crate::session::image_describe::persist_and_prepend_image_files(
-                &session_dir,
-                &user_images,
-                &user_message,
-            )
-            .map_err(|e| {
-                acp::Error::internal_error()
-                    .data(format!("failed to save user images to assets dir: {e}"))
-            })?
         };
-        let attached_image_refs = if self.is_cursor_harness() {
-            Vec::new()
-        } else {
-            crate::session::placeholder_images::attached_image_references(&user_images)
-        };
+        // Images are transcribed by the image-description model and reach the
+        // coding model as text, so no inline image references are attached.
+        let attached_image_refs = Vec::new();
         self.tool_bridge_handle()
             .update_resource(xai_grok_tools::types::resources::AttachedImages(
                 attached_image_refs,
@@ -778,14 +734,8 @@ impl SessionActor {
                 }
             };
             user_chat.set_prompt_index(current_prompt_index);
-            if !self.is_cursor_harness() {
-                for image in &user_images {
-                    user_chat.add_image(pick_user_image_url(image));
-                }
-                for image in &extra_images {
-                    user_chat.add_image(format!("data:{};base64,{}", image.mime_type, image.data));
-                }
-            }
+            // Images never enter the conversation as inline multimodal parts:
+            // the image-description model transcribes them into text first.
             if let Some(ack) = persist_ack {
                 if self
                     .chat_state_handle

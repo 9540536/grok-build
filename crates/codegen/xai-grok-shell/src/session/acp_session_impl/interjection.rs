@@ -115,10 +115,11 @@ impl SessionActor {
         true
     }
     /// Normalize interjection images for injection (shared pipeline above);
-    /// notices append to `wrapped` (TEXT side only). Returns the images to
-    /// attach structurally. Sessions whose template rejects inline images
-    /// instead transcribe normalized survivors into the text via the existing
-    /// describe pipeline, or drop them with a notice.
+    /// notices append to `wrapped` (TEXT side only). Images are always
+    /// transcribed into the text via the image-description model — the coding
+    /// model never receives inline image parts — or dropped with a notice on
+    /// failure. Returns the images to attach structurally: always empty, since
+    /// transcription replaces them with text.
     async fn prepare_interjection_images(
         &self,
         wrapped: &mut String,
@@ -127,13 +128,9 @@ impl SessionActor {
         if images.is_empty() {
             return images;
         }
-        let is_cursor = self.is_cursor_harness();
         let images = self
-            .normalize_images_with_notices(wrapped, images, is_cursor)
+            .normalize_images_with_notices(wrapped, images, self.is_cursor_harness())
             .await;
-        if !is_cursor {
-            return images;
-        }
         if !images.is_empty() {
             match self.transcribe_user_images(wrapped.clone(), &images).await {
                 Ok(new_text) => *wrapped = new_text,
@@ -322,6 +319,8 @@ impl SessionActor {
                 None => wrapped.clone(),
             };
             let mut item = ConversationItem::interjection(model_text);
+            // `prepare_interjection_images` transcribes images into text, so
+            // this list is always empty and nothing is attached inline.
             for img in &images {
                 item.add_image(pick_user_image_url(img));
             }
